@@ -32,7 +32,7 @@ source_db:
   dbname: "simrs_db"
 
 gateway:
-  url: "http://localhost:8080"
+  url: "http://192.168.11.94:8080"
 
 polling:
   interval_seconds: 5
