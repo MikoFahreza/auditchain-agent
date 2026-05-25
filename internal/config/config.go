@@ -1,39 +1,42 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 
+	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Client   ClientConfig   `yaml:"client"`
-	SourceDB SourceDBConfig `yaml:"source_db"`
-	Gateway  GatewayConfig  `yaml:"gateway"`
-	Polling  PollingConfig  `yaml:"polling"`
-	Tables   []TableConfig  `yaml:"tables"`
+	Client   ClientConfig
+	SourceDB SourceDBConfig
+	Gateway  GatewayConfig
+	Polling  PollingConfig
+	Tables   []TableConfig `yaml:"tables"`
 }
 
 type ClientConfig struct {
-	APIKey string `yaml:"api_key"`
+	APIKey string
 }
 
 type SourceDBConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	DBName   string `yaml:"dbname"`
+	Host     string
+	Port     int
+	User     string
+	Password string
+	DBName   string
 }
 
 type GatewayConfig struct {
-	URL            string `yaml:"url"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	URL            string
+	TimeoutSeconds int
 }
 
 type PollingConfig struct {
-	IntervalSeconds int `yaml:"interval_seconds"`
-	BatchSize       int `yaml:"batch_size"`
+	IntervalSeconds int
+	BatchSize       int
 }
 
 type TableConfig struct {
@@ -43,28 +46,56 @@ type TableConfig struct {
 	SourceSystem  string `yaml:"source_system"`
 }
 
-func Load(path string) (*Config, error) {
-	f, err := os.Open(path)
+func Load(configPath string) (*Config, error) {
+	// 1. Load .env
+	godotenv.Load()
+
+	// 2. Load tabel dari config.yml
+	f, err := os.Open(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gagal buka config file: %w", err)
 	}
 	defer f.Close()
 
 	var cfg Config
 	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gagal parse config file: %w", err)
 	}
 
-	// Default values
-	if cfg.Polling.IntervalSeconds == 0 {
-		cfg.Polling.IntervalSeconds = 5
-	}
-	if cfg.Polling.BatchSize == 0 {
-		cfg.Polling.BatchSize = 50
-	}
-	if cfg.Gateway.TimeoutSeconds == 0 {
-		cfg.Gateway.TimeoutSeconds = 10
-	}
+	// 3. Load nilai penting dari environment variables
+	cfg.Client.APIKey = requireEnv("AUDITCHAIN_API_KEY")
+
+	cfg.SourceDB.Host = requireEnv("DB_HOST")
+	cfg.SourceDB.Port = envInt("DB_PORT", 5432)
+	cfg.SourceDB.User = requireEnv("DB_USER")
+	cfg.SourceDB.Password = requireEnv("DB_PASSWORD")
+	cfg.SourceDB.DBName = requireEnv("DB_NAME")
+
+	cfg.Gateway.URL = requireEnv("GATEWAY_URL")
+	cfg.Gateway.TimeoutSeconds = envInt("GATEWAY_TIMEOUT_SECONDS", 10)
+
+	cfg.Polling.IntervalSeconds = envInt("POLLING_INTERVAL_SECONDS", 5)
+	cfg.Polling.BatchSize = envInt("POLLING_BATCH_SIZE", 50)
 
 	return &cfg, nil
+}
+
+func requireEnv(key string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		panic(fmt.Sprintf("environment variable %s wajib diisi", key))
+	}
+	return val
+}
+
+func envInt(key string, defaultVal int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return defaultVal
+	}
+	return n
 }

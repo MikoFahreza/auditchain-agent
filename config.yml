@@ -1,35 +1,7 @@
 # ================================================================
-# AuditChain Agent — Konfigurasi
-# Sesuaikan file ini untuk setiap deployment di klien
+# AuditChain Agent — Konfigurasi Tabel
 # ================================================================
 
-# Identitas klien di sistem AuditChain
-# Dapatkan dari endpoint POST /api/admin/clients saat registrasi
-client:
-  api_key: "ISI_API_KEY_KLIEN_DISINI"
-
-# Koneksi ke database sumber (database klien)
-source_db:
-  host: "localhost"
-  port: 5434
-  user: "simrs"
-  password: "simrs123"
-  dbname: "simrs_db"
-
-# Target Gateway AuditChain
-gateway:
-  url: "http://localhost:8080"
-  timeout_seconds: 10
-
-# Konfigurasi polling
-polling:
-  interval_seconds: 5    # seberapa sering agent cek perubahan
-  batch_size: 50         # maksimal log per sekali kirim
-
-# Tabel yang dimonitor beserta field mapping-nya
-# actor_field   → siapa yang melakukan aksi
-# action        → nama aksi (INSERT/UPDATE/DELETE)
-# resource_field → identifier unik baris yang berubah
 tables:
   - name: pasien
     actor_field: modified_by
