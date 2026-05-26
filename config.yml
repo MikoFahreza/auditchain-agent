@@ -1,19 +1,15 @@
 # ================================================================
 # AuditChain Agent — Konfigurasi Tabel
+# actor dan resource sekarang diambil dari audit_trail (via trigger)
+# field ini hanya dipakai untuk source_system
 # ================================================================
 
 tables:
   - name: pasien
-    actor_field: modified_by
-    resource_field: no_rm
     source_system: SIMRS-Pasien
 
   - name: rekam_medis
-    actor_field: dokter_id
-    resource_field: no_rm
     source_system: SIMRS-RekamMedis
 
   - name: transaksi
-    actor_field: kasir_id
-    resource_field: no_invoice
     source_system: SIMRS-Transaksi

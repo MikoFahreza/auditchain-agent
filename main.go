@@ -17,7 +17,6 @@ import (
 )
 
 func main() {
-	// 1. Load konfigurasi
 	cfgPath := "config.yml"
 	if len(os.Args) > 1 {
 		cfgPath = os.Args[1]
@@ -32,16 +31,11 @@ func main() {
 	log.Printf("   Gateway  : %s", cfg.Gateway.URL)
 	log.Printf("   Source DB: %s:%d/%s", cfg.SourceDB.Host, cfg.SourceDB.Port, cfg.SourceDB.DBName)
 	log.Printf("   Interval : %d detik", cfg.Polling.IntervalSeconds)
-	log.Printf("   Tabel    : %d tabel dimonitor", len(cfg.Tables))
 
-	// 2. Koneksi ke database sumber
 	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		cfg.SourceDB.Host,
-		cfg.SourceDB.Port,
-		cfg.SourceDB.User,
-		cfg.SourceDB.Password,
-		cfg.SourceDB.DBName,
+		cfg.SourceDB.Host, cfg.SourceDB.Port,
+		cfg.SourceDB.User, cfg.SourceDB.Password, cfg.SourceDB.DBName,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,12 +52,10 @@ func main() {
 	}
 	log.Println("✅ Koneksi ke database berhasil")
 
-	// 3. Inisialisasi poller dan publisher
 	p := poller.New(db, cfg)
 	pub := publisher.New(cfg)
 
-	// 4. Mulai polling loop
-	log.Printf("🚀 AuditChain Agent mulai berjalan...")
+	log.Println("🚀 AuditChain Agent mulai berjalan — polling audit_trail...")
 	ticker := time.NewTicker(time.Duration(cfg.Polling.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
@@ -74,26 +66,22 @@ func main() {
 			return
 
 		case <-ticker.C:
-			for _, table := range cfg.Tables {
-				entries, err := p.PollTable(ctx, table)
-				if err != nil {
-					log.Printf("❌ [Poller] Error tabel %s: %v", table.Name, err)
-					continue
-				}
-
-				if len(entries) == 0 {
-					continue
-				}
-
-				if err := pub.Publish(ctx, entries); err != nil {
-					log.Printf("❌ [Publisher] Gagal kirim %d log dari tabel %s: %v",
-						len(entries), table.Name, err)
-					continue
-				}
-
-				log.Printf("📤 [Publisher] %d log dari tabel %s berhasil dikirim ke Gateway",
-					len(entries), table.Name)
+			entries, err := p.Poll(ctx)
+			if err != nil {
+				log.Printf("❌ [Poller] Error: %v", err)
+				continue
 			}
+
+			if len(entries) == 0 {
+				continue
+			}
+
+			if err := pub.Publish(ctx, entries); err != nil {
+				log.Printf("❌ [Publisher] Gagal kirim %d log: %v", len(entries), err)
+				continue
+			}
+
+			log.Printf("📤 [Publisher] %d log berhasil dikirim ke Gateway", len(entries))
 		}
 	}
 }

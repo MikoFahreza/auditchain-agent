@@ -39,18 +39,16 @@ type PollingConfig struct {
 	BatchSize       int
 }
 
+// TableConfig hanya menyimpan source_system per tabel
+// actor dan resource diambil langsung dari audit_trail via trigger
 type TableConfig struct {
-	Name          string `yaml:"name"`
-	ActorField    string `yaml:"actor_field"`
-	ResourceField string `yaml:"resource_field"`
-	SourceSystem  string `yaml:"source_system"`
+	Name         string `yaml:"name"`
+	SourceSystem string `yaml:"source_system"`
 }
 
 func Load(configPath string) (*Config, error) {
-	// 1. Load .env
 	godotenv.Load()
 
-	// 2. Load tabel dari config.yml
 	f, err := os.Open(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("gagal buka config file: %w", err)
@@ -62,20 +60,16 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("gagal parse config file: %w", err)
 	}
 
-	// 3. Load nilai penting dari environment variables
 	cfg.Client.APIKey = requireEnv("AUDITCHAIN_API_KEY")
-
-	cfg.SourceDB.Host = requireEnv("DB_HOST")
-	cfg.SourceDB.Port = envInt("DB_PORT", 5432)
+	cfg.SourceDB.Host = getEnv("DB_HOST", "localhost")
+	cfg.SourceDB.Port = getEnvInt("DB_PORT", 5432)
 	cfg.SourceDB.User = requireEnv("DB_USER")
 	cfg.SourceDB.Password = requireEnv("DB_PASSWORD")
 	cfg.SourceDB.DBName = requireEnv("DB_NAME")
-
 	cfg.Gateway.URL = requireEnv("GATEWAY_URL")
-	cfg.Gateway.TimeoutSeconds = envInt("GATEWAY_TIMEOUT_SECONDS", 10)
-
-	cfg.Polling.IntervalSeconds = envInt("POLLING_INTERVAL_SECONDS", 5)
-	cfg.Polling.BatchSize = envInt("POLLING_BATCH_SIZE", 50)
+	cfg.Gateway.TimeoutSeconds = getEnvInt("GATEWAY_TIMEOUT_SECONDS", 10)
+	cfg.Polling.IntervalSeconds = getEnvInt("POLLING_INTERVAL_SECONDS", 5)
+	cfg.Polling.BatchSize = getEnvInt("POLLING_BATCH_SIZE", 50)
 
 	return &cfg, nil
 }
@@ -88,14 +82,18 @@ func requireEnv(key string) string {
 	return val
 }
 
-func envInt(key string, defaultVal int) int {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultVal
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	n, err := strconv.Atoi(val)
-	if err != nil {
-		return defaultVal
+	return def
+}
+
+func getEnvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
-	return n
+	return def
 }

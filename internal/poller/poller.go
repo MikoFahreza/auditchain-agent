@@ -2,17 +2,17 @@ package poller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	"auditchain-agent/internal/config"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// LogEntry adalah hasil polling dari satu baris yang berubah
+// LogEntry adalah hasil polling dari audit_trail
 type LogEntry struct {
 	Actor        string
 	Action       string
@@ -31,32 +31,102 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Poller {
 	return &Poller{db: db, cfg: cfg}
 }
 
-// PollTable mengambil baris yang berubah sejak last_polled dari tabel tertentu
-func (p *Poller) PollTable(ctx context.Context, table config.TableConfig) ([]LogEntry, error) {
-	// 1. Ambil checkpoint terakhir untuk tabel ini
-	var lastPolled time.Time
+// Poll mengambil entri baru dari audit_trail sejak id terakhir
+func (p *Poller) Poll(ctx context.Context) ([]LogEntry, error) {
+	// 1. Ambil checkpoint terakhir
+	var lastIDStr string
 	err := p.db.QueryRow(ctx,
-		"SELECT last_polled FROM agent_checkpoints WHERE table_name = $1",
-		table.Name,
-	).Scan(&lastPolled)
+		"SELECT value FROM agent_checkpoints WHERE key = 'audit_trail_last_id'",
+	).Scan(&lastIDStr)
 	if err != nil {
-		return nil, fmt.Errorf("gagal baca checkpoint tabel %s: %w", table.Name, err)
+		return nil, fmt.Errorf("gagal baca checkpoint: %w", err)
 	}
 
-	// 2. Query baris yang modified_at > lastPolled
-	query := fmt.Sprintf(
-		"SELECT * FROM %s WHERE modified_at > $1 ORDER BY modified_at ASC LIMIT $2",
-		table.Name,
-	)
+	var lastID int
+	fmt.Sscanf(lastIDStr, "%d", &lastID)
 
-	rows, err := p.db.Query(ctx, query, lastPolled, p.cfg.Polling.BatchSize)
+	// 2. Ambil entri baru dari audit_trail
+	rows, err := p.db.Query(ctx, `
+		SELECT id, tabel, operasi, db_user, app_user, data_lama, data_baru, waktu
+		FROM audit_trail
+		WHERE id > $1
+		ORDER BY id ASC
+		LIMIT $2
+	`, lastID, p.cfg.Polling.BatchSize)
 	if err != nil {
-		return nil, fmt.Errorf("gagal polling tabel %s: %w", table.Name, err)
+		return nil, fmt.Errorf("gagal polling audit_trail: %w", err)
 	}
 	defer rows.Close()
 
-	entries, latestTime, err := p.parseRows(rows, table, lastPolled)
-	if err != nil {
+	var entries []LogEntry
+	var latestID int
+
+	for rows.Next() {
+		var (
+			id                       int
+			tabel, operasi           string
+			dbUser                   string
+			appUser                  *string
+			dataLamaRaw, dataBaruRaw *string
+			waktu                    time.Time
+		)
+
+		if err := rows.Scan(&id, &tabel, &operasi, &dbUser, &appUser, &dataLamaRaw, &dataBaruRaw, &waktu); err != nil {
+			log.Printf("[Poller] ⚠️ Gagal scan baris: %v", err)
+			continue
+		}
+
+		latestID = id
+
+		// Tentukan actor: utamakan app_user, fallback ke db_user
+		actor := dbUser
+		if appUser != nil && *appUser != "" {
+			actor = *appUser
+		}
+
+		// Tentukan resource dari data_baru atau data_lama
+		resource := tabel
+		dataJSON := dataBaruRaw
+		if dataJSON == nil {
+			dataJSON = dataLamaRaw
+		}
+
+		var dataMap map[string]interface{}
+		if dataJSON != nil {
+			json.Unmarshal([]byte(*dataJSON), &dataMap)
+			resource = buildResource(tabel, dataMap)
+		}
+
+		// Tentukan source_system dari config tabel
+		sourceSystem := p.getSourceSystem(tabel)
+
+		// Metadata: gabung data_lama dan data_baru
+		metadata := map[string]interface{}{
+			"db_user":  dbUser,
+			"app_user": appUser,
+		}
+		if dataLamaRaw != nil {
+			var dl map[string]interface{}
+			json.Unmarshal([]byte(*dataLamaRaw), &dl)
+			metadata["data_lama"] = dl
+		}
+		if dataBaruRaw != nil {
+			var db map[string]interface{}
+			json.Unmarshal([]byte(*dataBaruRaw), &db)
+			metadata["data_baru"] = db
+		}
+
+		entries = append(entries, LogEntry{
+			Actor:        actor,
+			Action:       operasi, // INSERT / UPDATE / DELETE
+			Resource:     resource,
+			Timestamp:    waktu,
+			SourceSystem: sourceSystem,
+			Metadata:     metadata,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -64,78 +134,43 @@ func (p *Poller) PollTable(ctx context.Context, table config.TableConfig) ([]Log
 		return nil, nil
 	}
 
-	// 3. Update checkpoint ke modified_at terbaru yang sudah diambil
+	// 3. Update checkpoint ke id terakhir yang sudah diambil
 	_, err = p.db.Exec(ctx,
-		"UPDATE agent_checkpoints SET last_polled = $1 WHERE table_name = $2",
-		latestTime, table.Name,
+		"UPDATE agent_checkpoints SET value = $1 WHERE key = 'audit_trail_last_id'",
+		fmt.Sprintf("%d", latestID),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("gagal update checkpoint tabel %s: %w", table.Name, err)
+		return nil, fmt.Errorf("gagal update checkpoint: %w", err)
 	}
 
-	log.Printf("[Poller] ✅ Tabel %s: %d baris baru ditemukan", table.Name, len(entries))
+	log.Printf("[Poller] ✅ %d entri baru dari audit_trail (id %d → %d)", len(entries), lastID+1, latestID)
 	return entries, nil
 }
 
-// parseRows mengubah hasil query menjadi slice LogEntry
-func (p *Poller) parseRows(rows pgx.Rows, table config.TableConfig, lastPolled time.Time) ([]LogEntry, time.Time, error) {
-	fieldDescs := rows.FieldDescriptions()
-	latestTime := lastPolled
-	var entries []LogEntry
-
-	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			return nil, latestTime, fmt.Errorf("gagal baca baris: %w", err)
-		}
-
-		// Mapping kolom ke map
-		rowMap := make(map[string]interface{})
-		for i, fd := range fieldDescs {
-			rowMap[string(fd.Name)] = values[i]
-		}
-
-		// Ambil nilai actor, resource, timestamp dari mapping config
-		actor := fmt.Sprintf("%v", rowMap[table.ActorField])
-		resource := fmt.Sprintf("%s:%s", table.Name, fmt.Sprintf("%v", rowMap[table.ResourceField]))
-
-		// Tentukan action berdasarkan konteks
-		// Karena polling, semua yang muncul dianggap UPDATE atau INSERT
-		// Agent tidak bisa bedakan INSERT vs UPDATE dari polling biasa
-		// Gunakan konvensi: kalau modified_at == created_at → INSERT, selainnya → UPDATE
-		action := "UPDATE"
-		if createdAt, ok := rowMap["created_at"]; ok {
-			if modifiedAt, ok2 := rowMap["modified_at"]; ok2 {
-				if fmt.Sprintf("%v", createdAt) == fmt.Sprintf("%v", modifiedAt) {
-					action = "INSERT"
-				}
-			}
-		}
-
-		var ts time.Time
-		if modifiedAt, ok := rowMap["modified_at"]; ok {
-			if t, ok := modifiedAt.(time.Time); ok {
-				ts = t
-				if t.After(latestTime) {
-					latestTime = t
-				}
-			}
-		}
-
-		// Hapus field internal dari metadata agar tidak redundan
-		delete(rowMap, table.ActorField)
-		delete(rowMap, "modified_at")
-		delete(rowMap, "modified_by")
-
-		entries = append(entries, LogEntry{
-			Actor:        actor,
-			Action:       action,
-			Resource:     resource,
-			Timestamp:    ts,
-			SourceSystem: table.SourceSystem,
-			Metadata:     rowMap,
-		})
+// buildResource membentuk identifier unik dari data baris
+func buildResource(tabel string, data map[string]interface{}) string {
+	keys := map[string]string{
+		"pasien":      "no_rm",
+		"rekam_medis": "no_rm",
+		"transaksi":   "no_invoice",
 	}
+	if key, ok := keys[tabel]; ok {
+		if val, ok := data[key]; ok {
+			return fmt.Sprintf("%s:%s:%v", tabel, key, val)
+		}
+	}
+	if id, ok := data["id"]; ok {
+		return fmt.Sprintf("%s:id:%v", tabel, id)
+	}
+	return tabel
+}
 
-	return entries, latestTime, rows.Err()
+// getSourceSystem mencari source_system dari config tabel
+func (p *Poller) getSourceSystem(tabel string) string {
+	for _, t := range p.cfg.Tables {
+		if t.Name == tabel {
+			return t.SourceSystem
+		}
+	}
+	return "SIMRS-Unknown"
 }
