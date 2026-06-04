@@ -12,14 +12,20 @@ import (
 	"auditchain-agent/internal/poller"
 )
 
-// GatewayPayload adalah format yang diterima Gateway API
+// GatewayPayload adalah format raw yang dikirim ke Gateway.
+// Field-field ini menggunakan nama kolom asli dari audit_trail —
+// Gateway akan memetakannya ke field standar menggunakan ClientFieldMapping.
 type GatewayPayload struct {
-	Actor        string                 `json:"actor"`
-	Action       string                 `json:"action"`
-	Resource     string                 `json:"resource"`
-	Timestamp    string                 `json:"timestamp"`
-	SourceSystem string                 `json:"source_system"`
+	// Field raw dari audit_trail (nama kolom asli)
+	DBUser    string  `json:"db_user"`
+	AppUser   *string `json:"app_user"`
+	Tabel     string  `json:"tabel"`
+	Operasi   string  `json:"operasi"`
+	Timestamp string  `json:"timestamp"`
+
+	// Metadata gabungan data_lama + data_baru untuk keperluan audit
 	Metadata     map[string]interface{} `json:"metadata"`
+	SourceSystem string                 `json:"source_system"`
 }
 
 type Publisher struct {
@@ -36,22 +42,31 @@ func New(cfg *config.Config) *Publisher {
 	}
 }
 
-// Publish mengirim batch log ke Gateway API
-func (p *Publisher) Publish(ctx context.Context, entries []poller.LogEntry) error {
+// Publish mengirim batch log mentah ke Gateway API
+func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	// Bentuk payload bulk sesuai format Gateway
 	payloads := make([]GatewayPayload, 0, len(entries))
 	for _, e := range entries {
+		// Gabungkan data_lama dan data_baru ke dalam metadata
+		metadata := map[string]interface{}{}
+		if e.DataLama != nil {
+			metadata["data_lama"] = e.DataLama
+		}
+		if e.DataBaru != nil {
+			metadata["data_baru"] = e.DataBaru
+		}
+
 		payloads = append(payloads, GatewayPayload{
-			Actor:        e.Actor,
-			Action:       e.Action,
-			Resource:     e.Resource,
-			Timestamp:    e.Timestamp.Format(time.RFC3339),
+			DBUser:       e.DBUser,
+			AppUser:      e.AppUser,
+			Tabel:        e.Tabel,
+			Operasi:      e.Operasi,
+			Timestamp:    e.Waktu.Format(time.RFC3339),
+			Metadata:     metadata,
 			SourceSystem: e.SourceSystem,
-			Metadata:     e.Metadata,
 		})
 	}
 

@@ -12,14 +12,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// LogEntry adalah hasil polling dari audit_trail
-type LogEntry struct {
-	Actor        string
-	Action       string
-	Resource     string
-	Timestamp    time.Time
-	SourceSystem string
-	Metadata     map[string]interface{}
+// RawLogEntry adalah data mentah dari audit_trail, dikirim apa adanya ke Gateway
+type RawLogEntry struct {
+	Tabel        string                 `json:"tabel"`
+	Operasi      string                 `json:"operasi"`
+	DBUser       string                 `json:"db_user"`
+	AppUser      *string                `json:"app_user"`
+	DataLama     map[string]interface{} `json:"data_lama"`
+	DataBaru     map[string]interface{} `json:"data_baru"`
+	Waktu        time.Time              `json:"waktu"`
+	SourceSystem string                 `json:"source_system"`
 }
 
 type Poller struct {
@@ -32,7 +34,7 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Poller {
 }
 
 // Poll mengambil entri baru dari audit_trail sejak id terakhir
-func (p *Poller) Poll(ctx context.Context) ([]LogEntry, error) {
+func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 	// 1. Ambil checkpoint terakhir
 	var lastIDStr string
 	err := p.db.QueryRow(ctx,
@@ -58,7 +60,7 @@ func (p *Poller) Poll(ctx context.Context) ([]LogEntry, error) {
 	}
 	defer rows.Close()
 
-	var entries []LogEntry
+	var entries []RawLogEntry
 	var latestID int
 
 	for rows.Next() {
@@ -78,51 +80,27 @@ func (p *Poller) Poll(ctx context.Context) ([]LogEntry, error) {
 
 		latestID = id
 
-		// Tentukan actor: utamakan app_user, fallback ke db_user
-		actor := dbUser
-		if appUser != nil && *appUser != "" {
-			actor = *appUser
-		}
-
-		// Tentukan resource dari data_baru atau data_lama
-		resource := tabel
-		dataJSON := dataBaruRaw
-		if dataJSON == nil {
-			dataJSON = dataLamaRaw
-		}
-
-		var dataMap map[string]interface{}
-		if dataJSON != nil {
-			json.Unmarshal([]byte(*dataJSON), &dataMap)
-			resource = buildResource(tabel, dataMap)
-		}
-
-		// Tentukan source_system dari config tabel
-		sourceSystem := p.getSourceSystem(tabel)
-
-		// Metadata: gabung data_lama dan data_baru
-		metadata := map[string]interface{}{
-			"db_user":  dbUser,
-			"app_user": appUser,
-		}
+		// Parse data_lama dan data_baru dari JSON string ke map
+		var dataLama, dataBaru map[string]interface{}
 		if dataLamaRaw != nil {
-			var dl map[string]interface{}
-			json.Unmarshal([]byte(*dataLamaRaw), &dl)
-			metadata["data_lama"] = dl
+			json.Unmarshal([]byte(*dataLamaRaw), &dataLama)
 		}
 		if dataBaruRaw != nil {
-			var db map[string]interface{}
-			json.Unmarshal([]byte(*dataBaruRaw), &db)
-			metadata["data_baru"] = db
+			json.Unmarshal([]byte(*dataBaruRaw), &dataBaru)
 		}
 
-		entries = append(entries, LogEntry{
-			Actor:        actor,
-			Action:       operasi, // INSERT / UPDATE / DELETE
-			Resource:     resource,
-			Timestamp:    waktu,
+		// Tentukan source_system dari config berdasarkan nama tabel
+		sourceSystem := p.getSourceSystem(tabel)
+
+		entries = append(entries, RawLogEntry{
+			Tabel:        tabel,
+			Operasi:      operasi,
+			DBUser:       dbUser,
+			AppUser:      appUser,
+			DataLama:     dataLama,
+			DataBaru:     dataBaru,
+			Waktu:        waktu,
 			SourceSystem: sourceSystem,
-			Metadata:     metadata,
 		})
 	}
 
@@ -143,29 +121,11 @@ func (p *Poller) Poll(ctx context.Context) ([]LogEntry, error) {
 		return nil, fmt.Errorf("gagal update checkpoint: %w", err)
 	}
 
-	log.Printf("[Poller] ✅ %d entri baru dari audit_trail (id %d → %d)", len(entries), lastID+1, latestID)
+	log.Printf("[Poller] ✅ %d entri baru dari audit_trail (id > %d)", len(entries), lastID)
 	return entries, nil
 }
 
-// buildResource membentuk identifier unik dari data baris
-func buildResource(tabel string, data map[string]interface{}) string {
-	keys := map[string]string{
-		"pasien":      "no_rm",
-		"rekam_medis": "no_rm",
-		"transaksi":   "no_invoice",
-	}
-	if key, ok := keys[tabel]; ok {
-		if val, ok := data[key]; ok {
-			return fmt.Sprintf("%s:%s:%v", tabel, key, val)
-		}
-	}
-	if id, ok := data["id"]; ok {
-		return fmt.Sprintf("%s:id:%v", tabel, id)
-	}
-	return tabel
-}
-
-// getSourceSystem mencari source_system dari config tabel
+// getSourceSystem mencari source_system dari config berdasarkan nama tabel
 func (p *Poller) getSourceSystem(tabel string) string {
 	for _, t := range p.cfg.Tables {
 		if t.Name == tabel {

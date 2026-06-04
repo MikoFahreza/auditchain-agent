@@ -1,7 +1,16 @@
 # ================================================================
 # AuditChain Agent — Konfigurasi Tabel
-# actor dan resource sekarang diambil dari audit_trail (via trigger)
-# field ini hanya dipakai untuk source_system
+#
+# Mapping field (actor, action, resource) tidak lagi dikonfigurasi
+# di sini — sepenuhnya ditangani oleh Gateway via ClientFieldMapping
+# yang disimpan di database Gateway saat registrasi klien.
+#
+# Konfigurasi Gateway untuk klien SIMRS:
+#   actor_field    = "app_user"   (fallback ke db_user jika null)
+#   action_field   = "operasi"
+#   resource_field = "tabel"
+#
+# Di sini hanya perlu source_system per tabel.
 # ================================================================
 
 tables:
