@@ -12,8 +12,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// RawLogEntry adalah data mentah dari audit_trail, dikirim apa adanya ke Gateway
+// RawLogEntry adalah data mentah dari audit_trail.
+// Penambahan: field ID (integer primary key dari audit_trail)
+// agar dapat diteruskan ke Gateway sebagai audit_trail_id.
 type RawLogEntry struct {
+	ID           int                    // BARU: audit_trail.id
 	Tabel        string                 `json:"tabel"`
 	Operasi      string                 `json:"operasi"`
 	DBUser       string                 `json:"db_user"`
@@ -33,9 +36,7 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Poller {
 	return &Poller{db: db, cfg: cfg}
 }
 
-// Poll mengambil entri baru dari audit_trail sejak id terakhir
 func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
-	// 1. Ambil checkpoint terakhir
 	var lastIDStr string
 	err := p.db.QueryRow(ctx,
 		"SELECT value FROM agent_checkpoints WHERE key = 'audit_trail_last_id'",
@@ -47,7 +48,7 @@ func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 	var lastID int
 	fmt.Sscanf(lastIDStr, "%d", &lastID)
 
-	// 2. Ambil entri baru dari audit_trail
+	// BARU: sertakan id dalam SELECT
 	rows, err := p.db.Query(ctx, `
 		SELECT id, tabel, operasi, db_user, app_user, data_lama, data_baru, waktu
 		FROM audit_trail
@@ -80,7 +81,6 @@ func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 
 		latestID = id
 
-		// Parse data_lama dan data_baru dari JSON string ke map
 		var dataLama, dataBaru map[string]interface{}
 		if dataLamaRaw != nil {
 			json.Unmarshal([]byte(*dataLamaRaw), &dataLama)
@@ -89,10 +89,8 @@ func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 			json.Unmarshal([]byte(*dataBaruRaw), &dataBaru)
 		}
 
-		// Tentukan source_system dari config berdasarkan nama tabel
-		sourceSystem := p.getSourceSystem(tabel)
-
 		entries = append(entries, RawLogEntry{
+			ID:           id, // BARU
 			Tabel:        tabel,
 			Operasi:      operasi,
 			DBUser:       dbUser,
@@ -100,19 +98,17 @@ func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 			DataLama:     dataLama,
 			DataBaru:     dataBaru,
 			Waktu:        waktu,
-			SourceSystem: sourceSystem,
+			SourceSystem: p.getSourceSystem(tabel),
 		})
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-
 	if len(entries) == 0 {
 		return nil, nil
 	}
 
-	// 3. Update checkpoint ke id terakhir yang sudah diambil
 	_, err = p.db.Exec(ctx,
 		"UPDATE agent_checkpoints SET value = $1 WHERE key = 'audit_trail_last_id'",
 		fmt.Sprintf("%d", latestID),
@@ -125,7 +121,6 @@ func (p *Poller) Poll(ctx context.Context) ([]RawLogEntry, error) {
 	return entries, nil
 }
 
-// getSourceSystem mencari source_system dari config berdasarkan nama tabel
 func (p *Poller) getSourceSystem(tabel string) string {
 	for _, t := range p.cfg.Tables {
 		if t.Name == tabel {

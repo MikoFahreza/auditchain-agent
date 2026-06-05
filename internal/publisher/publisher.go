@@ -6,16 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"auditchain-agent/internal/config"
 	"auditchain-agent/internal/poller"
 )
 
-// GatewayPayload adalah format raw yang dikirim ke Gateway.
-// Field-field ini menggunakan nama kolom asli dari audit_trail —
-// Gateway akan memetakannya ke field standar menggunakan ClientFieldMapping.
+// GatewayPayload adalah format yang dikirim ke Gateway.
+// Penambahan: AuditTrailID dikirim agar Gateway bisa meminta
+// Agent memverifikasi baris spesifik ini saat Lapis 3.
 type GatewayPayload struct {
+	// BARU: ID baris di audit_trail klien.
+	// Digunakan Gateway untuk memanggil GET /verify/<audit_trail_id> ke Agent.
+	AuditTrailID string `json:"audit_trail_id"`
+
 	// Field raw dari audit_trail (nama kolom asli)
 	DBUser    string  `json:"db_user"`
 	AppUser   *string `json:"app_user"`
@@ -23,7 +28,7 @@ type GatewayPayload struct {
 	Operasi   string  `json:"operasi"`
 	Timestamp string  `json:"timestamp"`
 
-	// Metadata gabungan data_lama + data_baru untuk keperluan audit
+	// Metadata gabungan data_lama + data_baru
 	Metadata     map[string]interface{} `json:"metadata"`
 	SourceSystem string                 `json:"source_system"`
 }
@@ -42,7 +47,7 @@ func New(cfg *config.Config) *Publisher {
 	}
 }
 
-// Publish mengirim batch log mentah ke Gateway API
+// Publish mengirim batch log ke Gateway API
 func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -50,7 +55,6 @@ func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) e
 
 	payloads := make([]GatewayPayload, 0, len(entries))
 	for _, e := range entries {
-		// Gabungkan data_lama dan data_baru ke dalam metadata
 		metadata := map[string]interface{}{}
 		if e.DataLama != nil {
 			metadata["data_lama"] = e.DataLama
@@ -60,6 +64,8 @@ func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) e
 		}
 
 		payloads = append(payloads, GatewayPayload{
+			// BARU: sertakan ID baris audit_trail agar Gateway bisa query balik ke Agent
+			AuditTrailID: strconv.Itoa(e.ID),
 			DBUser:       e.DBUser,
 			AppUser:      e.AppUser,
 			Tabel:        e.Tabel,
