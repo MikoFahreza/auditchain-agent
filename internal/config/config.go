@@ -13,7 +13,7 @@ type Config struct {
 	Client   ClientConfig
 	SourceDB SourceDBConfig
 	Gateway  GatewayConfig
-	Polling  PollingConfig
+	Kafka    KafkaConfig
 	Tables   []TableConfig `yaml:"tables"`
 }
 
@@ -34,13 +34,13 @@ type GatewayConfig struct {
 	TimeoutSeconds int
 }
 
-type PollingConfig struct {
-	IntervalSeconds int
-	BatchSize       int
+type KafkaConfig struct {
+	Brokers      string
+	TopicPrefix  string
+	GroupID      string
+	SourceSystem string
 }
 
-// TableConfig hanya menyimpan source_system per tabel
-// actor dan resource diambil langsung dari audit_trail via trigger
 type TableConfig struct {
 	Name         string `yaml:"name"`
 	SourceSystem string `yaml:"source_system"`
@@ -61,15 +61,19 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	cfg.Client.APIKey = requireEnv("AUDITCHAIN_API_KEY")
-	cfg.SourceDB.Host = getEnv("DB_HOST", "localhost")
-	cfg.SourceDB.Port = getEnvInt("DB_PORT", 5432)
-	cfg.SourceDB.User = requireEnv("DB_USER")
-	cfg.SourceDB.Password = requireEnv("DB_PASSWORD")
-	cfg.SourceDB.DBName = requireEnv("DB_NAME")
 	cfg.Gateway.URL = requireEnv("GATEWAY_URL")
 	cfg.Gateway.TimeoutSeconds = getEnvInt("GATEWAY_TIMEOUT_SECONDS", 10)
-	cfg.Polling.IntervalSeconds = getEnvInt("POLLING_INTERVAL_SECONDS", 5)
-	cfg.Polling.BatchSize = getEnvInt("POLLING_BATCH_SIZE", 50)
+
+	cfg.SourceDB.Host = getEnv("DB_HOST", "localhost")
+	cfg.SourceDB.Port = getEnvInt("DB_PORT", 5432)
+	cfg.SourceDB.User = getEnv("DB_USER", "")
+	cfg.SourceDB.Password = getEnv("DB_PASSWORD", "")
+	cfg.SourceDB.DBName = getEnv("DB_NAME", "test_postgis")
+
+	cfg.Kafka.Brokers = getEnv("KAFKA_BROKERS", "localhost:9092")
+	cfg.Kafka.TopicPrefix = getEnv("KAFKA_TOPIC_PREFIX", "satu_peta.public.")
+	cfg.Kafka.GroupID = getEnv("KAFKA_GROUP_ID", "auditchain-agent-group")
+	cfg.Kafka.SourceSystem = getEnv("KAFKA_SOURCE_SYSTEM", "SATU-PETA")
 
 	return &cfg, nil
 }

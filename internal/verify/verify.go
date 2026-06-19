@@ -5,30 +5,25 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// AuditTrailRecord adalah data yang dikembalikan ke Gateway saat verifikasi.
-// Field disesuaikan persis dengan kolom tabel audit_trail di DB klien.
-type AuditTrailRecord struct {
-	Found    bool                   `json:"found"`
-	ID       int                    `json:"id"`
-	Tabel    string                 `json:"tabel"`
-	Operasi  string                 `json:"operasi"`
-	DBUser   string                 `json:"db_user"`
-	AppUser  *string                `json:"app_user"`
-	DataLama map[string]interface{} `json:"data_lama"`
-	DataBaru map[string]interface{} `json:"data_baru"`
-	Waktu    time.Time              `json:"waktu"`
+// ResourceRecord adalah data yang dikembalikan ke Gateway saat verifikasi.
+// Berisi semua kolom non-geometry dari baris yang diminta.
+type ResourceRecord struct {
+	Found     bool                   `json:"found"`
+	Table     string                 `json:"table"`
+	ID        string                 `json:"id"`
+	Data      map[string]interface{} `json:"data"`
+	CheckedAt time.Time              `json:"checked_at"`
 }
 
-// Server adalah HTTP server kecil yang berjalan di sisi Agent
-// untuk melayani request verifikasi dari Gateway.
 type Server struct {
 	db          *pgxpool.Pool
-	verifyToken string // Bearer token — harus sama dengan yang dikonfigurasi di Gateway
+	verifyToken string
 	port        string
 }
 
@@ -38,7 +33,14 @@ func NewServer(db *pgxpool.Pool, verifyToken, port string) *Server {
 
 func (s *Server) Start() {
 	mux := http.NewServeMux()
+
+	// Endpoint lama — audit_trail (untuk SIMRS)
 	mux.HandleFunc("/verify/", s.handleVerify)
+
+	// Endpoint baru — resource geospasial (untuk Satu Peta)
+	// Format: GET /verify-resource/<table>/<id>
+	mux.HandleFunc("/verify-resource/", s.handleVerifyResource)
+
 	mux.HandleFunc("/health", s.handleHealth)
 
 	addr := ":" + s.port
@@ -48,16 +50,15 @@ func (s *Server) Start() {
 	}
 }
 
-// handleVerify melayani GET /verify/<audit_trail_id>
-// Gateway memanggil ini dengan ID dari kolom audit_trail.id yang
-// sudah dikirim Agent ke Gateway sebelumnya sebagai log_id.
-func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+// handleVerifyResource melayani GET /verify-resource/<table>/<id>
+// Gateway memanggil ini dengan nama tabel dan id dari kolom resource (format: tabel:id)
+func (s *Server) handleVerifyResource(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Autentikasi: pastikan request dari Gateway yang terdaftar
+	// Autentikasi
 	if s.verifyToken != "" {
 		got := r.Header.Get("Authorization")
 		if got != "Bearer "+s.verifyToken {
@@ -66,57 +67,158 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Ekstrak audit_trail_id dari path: /verify/<id>
+	// Ekstrak table dan id dari path: /verify-resource/<table>/<id>
+	path := strings.TrimPrefix(r.URL.Path, "/verify-resource/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "format path harus /verify-resource/<table>/<id>", http.StatusBadRequest)
+		return
+	}
+
+	tableName := parts[0]
+	resourceID := parts[1]
+
+	rec := s.queryResource(r.Context(), tableName, resourceID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rec)
+}
+
+// queryResource mengambil satu baris dari tabel berdasarkan primary key
+// Primary key dicoba secara berurutan: ogc_fid, id, _id, fid, gid
+func (s *Server) queryResource(ctx context.Context, tableName, resourceID string) ResourceRecord {
+	// Kandidat nama kolom primary key
+	pkCandidates := []string{"ogc_fid", "id", "_id", "fid", "gid", "objectid"}
+
+	// Cari kolom PK yang ada di tabel ini
+	pkCol := s.findPKColumn(ctx, tableName, pkCandidates)
+	if pkCol == "" {
+		log.Printf("[VerifyServer] Tidak ditemukan kolom PK di tabel %s", tableName)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// Query baris — exclude kolom geometry otomatis via pg_catalog
+	// Ambil semua kolom kecuali tipe geometry/geography
+	query := `
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = 'public' 
+		AND table_name = $1
+		AND udt_name NOT IN ('geometry', 'geography', 'raster')
+		ORDER BY ordinal_position
+	`
+
+	rows, err := s.db.Query(ctx, query, tableName)
+	if err != nil {
+		log.Printf("[VerifyServer] Gagal ambil kolom tabel %s: %v", tableName, err)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err == nil {
+			columns = append(columns, col)
+		}
+	}
+
+	if len(columns) == 0 {
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// Build SELECT query dengan kolom yang aman
+	colList := ""
+	for i, col := range columns {
+		if i > 0 {
+			colList += ", "
+		}
+		colList += `"` + col + `"`
+	}
+
+	dataQuery := `SELECT ` + colList + ` FROM public."` + tableName + `" WHERE "` + pkCol + `" = $1 LIMIT 1`
+
+	dataRows, err := s.db.Query(ctx, dataQuery, resourceID)
+	if err != nil {
+		log.Printf("[VerifyServer] Gagal query tabel %s id=%s: %v", tableName, resourceID, err)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+	defer dataRows.Close()
+
+	if !dataRows.Next() {
+		// Baris tidak ditemukan — kemungkinan sudah di-DELETE
+		log.Printf("[VerifyServer] Baris tidak ditemukan: tabel=%s id=%s", tableName, resourceID)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// Scan hasil ke map
+	fieldDescriptions := dataRows.FieldDescriptions()
+	values, err := dataRows.Values()
+	if err != nil {
+		log.Printf("[VerifyServer] Gagal scan values: %v", err)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	data := make(map[string]interface{})
+	for i, fd := range fieldDescriptions {
+		data[string(fd.Name)] = values[i]
+	}
+
+	return ResourceRecord{
+		Found:     true,
+		Table:     tableName,
+		ID:        resourceID,
+		Data:      data,
+		CheckedAt: time.Now(),
+	}
+}
+
+// findPKColumn mencari kolom primary key yang ada di tabel
+func (s *Server) findPKColumn(ctx context.Context, tableName string, candidates []string) string {
+	query := `
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = 'public' 
+		AND table_name = $1 
+		AND column_name = ANY($2)
+		LIMIT 1
+	`
+
+	var colName string
+	for _, candidate := range candidates {
+		err := s.db.QueryRow(ctx, query, tableName, []string{candidate}).Scan(&colName)
+		if err == nil {
+			return colName
+		}
+	}
+	return ""
+}
+
+// handleVerify — endpoint lama untuk SIMRS (audit_trail by id)
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.verifyToken != "" {
+		got := r.Header.Get("Authorization")
+		if got != "Bearer "+s.verifyToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	auditTrailID := r.URL.Path[len("/verify/"):]
 	if auditTrailID == "" {
 		http.Error(w, "audit_trail_id diperlukan", http.StatusBadRequest)
 		return
 	}
 
-	rec := s.queryAuditTrail(r.Context(), auditTrailID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rec)
-}
-
-// queryAuditTrail mengambil satu baris dari audit_trail berdasarkan ID.
-// ID ini adalah nilai integer dari kolom `id` di audit_trail,
-// yang dikirim Agent ke Gateway sebagai bagian dari log_id.
-func (s *Server) queryAuditTrail(ctx context.Context, id string) AuditTrailRecord {
-	var rec AuditTrailRecord
-	var dataLamaRaw, dataBaruRaw *string
-
-	err := s.db.QueryRow(ctx, `
-		SELECT id, tabel, operasi, db_user, app_user, data_lama, data_baru, waktu
-		FROM audit_trail
-		WHERE id = $1
-		LIMIT 1
-	`, id).Scan(
-		&rec.ID,
-		&rec.Tabel,
-		&rec.Operasi,
-		&rec.DBUser,
-		&rec.AppUser,
-		&dataLamaRaw,
-		&dataBaruRaw,
-		&rec.Waktu,
-	)
-
-	if err != nil {
-		// Tidak ditemukan atau error → kembalikan Found=false
-		// Gateway akan menafsirkan ini sebagai indikasi penghapusan ilegal
-		log.Printf("[VerifyServer] Tidak ditemukan audit_trail id=%s: %v", id, err)
-		return AuditTrailRecord{Found: false}
-	}
-
-	if dataLamaRaw != nil {
-		json.Unmarshal([]byte(*dataLamaRaw), &rec.DataLama)
-	}
-	if dataBaruRaw != nil {
-		json.Unmarshal([]byte(*dataBaruRaw), &rec.DataBaru)
-	}
-
-	rec.Found = true
-	return rec
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":   false,
+		"message": "endpoint ini tidak digunakan untuk Satu Peta",
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

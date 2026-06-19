@@ -1,24 +1,3 @@
-# ================================================================
-# AuditChain Agent — Konfigurasi Tabel
-#
-# Mapping field (actor, action, resource) tidak lagi dikonfigurasi
-# di sini — sepenuhnya ditangani oleh Gateway via ClientFieldMapping
-# yang disimpan di database Gateway saat registrasi klien.
-#
-# Konfigurasi Gateway untuk klien SIMRS:
-#   actor_field    = "app_user"   (fallback ke db_user jika null)
-#   action_field   = "operasi"
-#   resource_field = "tabel"
-#
-# Di sini hanya perlu source_system per tabel.
-# ================================================================
-
 tables:
-  - name: pasien
-    source_system: SIMRS-Pasien
-
-  - name: rekam_medis
-    source_system: SIMRS-RekamMedis
-
-  - name: transaksi
-    source_system: SIMRS-Transaksi
+  - name: "*"
+    source_system: SATU-PETA
