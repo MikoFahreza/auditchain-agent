@@ -6,31 +6,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"auditchain-agent/internal/config"
-	"auditchain-agent/internal/poller"
 )
 
-// GatewayPayload adalah format yang dikirim ke Gateway.
-// Penambahan: AuditTrailID dikirim agar Gateway bisa meminta
-// Agent memverifikasi baris spesifik ini saat Lapis 3.
+type LogEntry struct {
+	Actor        string
+	Action       string
+	Resource     string
+	Timestamp    time.Time
+	SourceSystem string
+	Metadata     map[string]interface{}
+}
+
 type GatewayPayload struct {
-	// BARU: ID baris di audit_trail klien.
-	// Digunakan Gateway untuk memanggil GET /verify/<audit_trail_id> ke Agent.
-	AuditTrailID string `json:"audit_trail_id"`
-
-	// Field raw dari audit_trail (nama kolom asli)
-	DBUser    string  `json:"db_user"`
-	AppUser   *string `json:"app_user"`
-	Tabel     string  `json:"tabel"`
-	Operasi   string  `json:"operasi"`
-	Timestamp string  `json:"timestamp"`
-
-	// Metadata gabungan data_lama + data_baru
-	Metadata     map[string]interface{} `json:"metadata"`
+	Actor        string                 `json:"actor"`
+	Action       string                 `json:"action"`
+	Resource     string                 `json:"resource"`
+	Timestamp    string                 `json:"timestamp"`
 	SourceSystem string                 `json:"source_system"`
+	Metadata     map[string]interface{} `json:"metadata"`
 }
 
 type Publisher struct {
@@ -47,32 +43,20 @@ func New(cfg *config.Config) *Publisher {
 	}
 }
 
-// Publish mengirim batch log ke Gateway API
-func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) error {
+func (p *Publisher) Publish(ctx context.Context, entries []LogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
 	payloads := make([]GatewayPayload, 0, len(entries))
 	for _, e := range entries {
-		metadata := map[string]interface{}{}
-		if e.DataLama != nil {
-			metadata["data_lama"] = e.DataLama
-		}
-		if e.DataBaru != nil {
-			metadata["data_baru"] = e.DataBaru
-		}
-
 		payloads = append(payloads, GatewayPayload{
-			// BARU: sertakan ID baris audit_trail agar Gateway bisa query balik ke Agent
-			AuditTrailID: strconv.Itoa(e.ID),
-			DBUser:       e.DBUser,
-			AppUser:      e.AppUser,
-			Tabel:        e.Tabel,
-			Operasi:      e.Operasi,
-			Timestamp:    e.Waktu.Format(time.RFC3339),
-			Metadata:     metadata,
+			Actor:        e.Actor,
+			Action:       e.Action,
+			Resource:     e.Resource,
+			Timestamp:    e.Timestamp.Format(time.RFC3339),
 			SourceSystem: e.SourceSystem,
+			Metadata:     e.Metadata,
 		})
 	}
 
@@ -97,7 +81,7 @@ func (p *Publisher) Publish(ctx context.Context, entries []poller.RawLogEntry) e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("Gateway menolak request dengan status: %d", resp.StatusCode)
+		return fmt.Errorf("Gateway menolak dengan status: %d", resp.StatusCode)
 	}
 
 	return nil
