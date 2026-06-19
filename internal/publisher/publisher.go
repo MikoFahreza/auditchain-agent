@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -83,6 +84,15 @@ func (p *Publisher) Publish(ctx context.Context, entries []LogEntry) error {
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("Gateway menolak dengan status: %d", resp.StatusCode)
 	}
+
+	// Log sukses per entry
+	for _, e := range entries {
+		log.Printf("✅ [Publisher] Terkirim → action=%-8s resource=%s source=%s",
+			e.Action, e.Resource, e.SourceSystem)
+	}
+
+	log.Printf("📤 [Publisher] %d log berhasil dikirim ke Gateway (%s)",
+		len(entries), p.cfg.Gateway.URL)
 
 	return nil
 }
