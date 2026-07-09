@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -83,9 +84,35 @@ func (s *Server) handleVerifyResource(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(rec)
 }
 
+// IsValidSQLIdentifier memvalidasi apakah string aman digunakan sebagai identifier SQL (seperti nama tabel/kolom)
+func IsValidSQLIdentifier(name string) bool {
+	if len(name) == 0 || len(name) > 63 {
+		return false
+	}
+	return regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(name)
+}
+
 // queryResource mengambil satu baris dari tabel berdasarkan primary key
 // Primary key dicoba secara berurutan: ogc_fid, id, _id, fid, gid
 func (s *Server) queryResource(ctx context.Context, tableName, resourceID string) ResourceRecord {
+	// 1. Validasi regex dasar untuk nama tabel (SQL Injection Prevention)
+	if !IsValidSQLIdentifier(tableName) {
+		log.Printf("[VerifyServer] Nama tabel tidak valid (karakter ilegal): %s", tableName)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// 2. Validasi apakah tabel tersebut benar-benar ada di schema public
+	var exists bool
+	err := s.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_schema = 'public' AND table_name = $1
+		)`, tableName).Scan(&exists)
+	if err != nil || !exists {
+		log.Printf("[VerifyServer] Tabel tidak ditemukan di database atau error: %s (err: %v)", tableName, err)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
 	// Kandidat nama kolom primary key
 	pkCandidates := []string{"ogc_fid", "id", "_id", "fid", "gid", "objectid"}
 
@@ -93,6 +120,12 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 	pkCol := s.findPKColumn(ctx, tableName, pkCandidates)
 	if pkCol == "" {
 		log.Printf("[VerifyServer] Tidak ditemukan kolom PK di tabel %s", tableName)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// Validasi regex kolom PK (tambahan proteksi)
+	if !IsValidSQLIdentifier(pkCol) {
+		log.Printf("[VerifyServer] Nama kolom PK tidak valid (karakter ilegal): %s", pkCol)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
@@ -118,7 +151,10 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 	for rows.Next() {
 		var col string
 		if err := rows.Scan(&col); err == nil {
-			columns = append(columns, col)
+			// Hanya tambahkan jika nama kolom aman
+			if IsValidSQLIdentifier(col) {
+				columns = append(columns, col)
+			}
 		}
 	}
 
