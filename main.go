@@ -9,9 +9,6 @@ import (
 	"syscall"
 
 	"auditchain-agent/internal/config"
-	"auditchain-agent/internal/consumer"
-	"auditchain-agent/internal/publisher"
-	schemawatcher "auditchain-agent/internal/schema_watcher"
 	"auditchain-agent/internal/verify"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -60,23 +57,10 @@ func main() {
 	verifyServer := verify.NewServer(db, verifyToken, verifyPort)
 	go verifyServer.Start()
 
-	// Schema watcher — mendeteksi CREATE/ALTER/DROP TABLE
-	debeziumURL := getEnv("DEBEZIUM_URL", "http://localhost:8083")
-	connectorName := getEnv("DEBEZIUM_CONNECTOR_NAME", "satu-peta-connector")
-	watcher := schemawatcher.New(db, debeziumURL, connectorName)
-	go watcher.Start(ctx)
+	log.Println("🚀 AuditChain Agent (Verify-Only mode) mulai berjalan...")
 
-	// Publisher ke Gateway
-	pub := publisher.New(cfg)
-
-	// Kafka consumer — membaca event CDC dari Debezium
-	cons := consumer.New(cfg, pub)
-
-	log.Println("🚀 AuditChain Agent (Debezium mode) mulai berjalan...")
-
-	if err := cons.Start(ctx); err != nil {
-		log.Fatalf("❌ Consumer error: %v", err)
-	}
+	// Tunggu sinyal interupsi/shutdown untuk berhenti secara bersih
+	<-ctx.Done()
 
 	log.Println("✅ Agent berhenti dengan bersih.")
 }

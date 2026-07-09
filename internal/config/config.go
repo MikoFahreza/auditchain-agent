@@ -60,8 +60,8 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("gagal parse config file: %w", err)
 	}
 
-	cfg.Client.APIKey = requireEnv("AUDITCHAIN_API_KEY")
-	cfg.Gateway.URL = requireEnv("GATEWAY_URL")
+	cfg.Client.APIKey = getEnv("AUDITCHAIN_API_KEY", "")
+	cfg.Gateway.URL = getEnv("GATEWAY_URL", "")
 	cfg.Gateway.TimeoutSeconds = getEnvInt("GATEWAY_TIMEOUT_SECONDS", 10)
 
 	cfg.SourceDB.Host = getEnv("DB_HOST", "localhost")
