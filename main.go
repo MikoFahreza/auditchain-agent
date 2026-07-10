@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"auditchain-agent/internal/config"
 	"auditchain-agent/internal/verify"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	goora "github.com/sijms/go-ora/v2"
 )
 
 func main() {
@@ -33,23 +35,33 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Koneksi ke PostgreSQL (untuk SchemaWatcher dan VerifyServer)
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		cfg.SourceDB.Host, cfg.SourceDB.Port,
-		cfg.SourceDB.User, cfg.SourceDB.Password, cfg.SourceDB.DBName,
-	)
+	// Ekstrak host dan port dari config
+	host := cfg.SourceDB.Host
+	port := cfg.SourceDB.Port
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		host = parts[0]
+		if p, err := strconv.Atoi(parts[1]); err == nil {
+			port = p
+		}
+	}
 
-	db, err := pgxpool.New(ctx, dsn)
+	// Gunakan BuildUrl dari go-ora dengan opsi SID
+	urlOptions := map[string]string{
+		"SID": cfg.SourceDB.DBName,
+	}
+	dsn := goora.BuildUrl(host, port, "", cfg.SourceDB.User, cfg.SourceDB.Password, urlOptions)
+
+	db, err := sql.Open("oracle", dsn)
 	if err != nil {
 		log.Fatalf("❌ Gagal koneksi ke database: %v", err)
 	}
 	defer db.Close()
 
-	if err := db.Ping(ctx); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		log.Fatalf("❌ Database tidak bisa dijangkau: %v", err)
 	}
-	log.Println("✅ Koneksi ke database berhasil")
+	log.Println("✅ Koneksi ke database Oracle (SID) berhasil")
 
 	// Verify server untuk Lapis 3 AuditChain
 	verifyToken := getEnv("AGENT_VERIFY_TOKEN", "")
