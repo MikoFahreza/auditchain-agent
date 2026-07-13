@@ -2,14 +2,13 @@ package verify
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ResourceRecord adalah data yang dikembalikan ke Gateway saat verifikasi.
@@ -23,12 +22,12 @@ type ResourceRecord struct {
 }
 
 type Server struct {
-	db          *pgxpool.Pool
+	db          *sql.DB
 	verifyToken string
 	port        string
 }
 
-func NewServer(db *pgxpool.Pool, verifyToken, port string) *Server {
+func NewServer(db *sql.DB, verifyToken, port string) *Server {
 	return &Server{db: db, verifyToken: verifyToken, port: port}
 }
 
@@ -93,7 +92,6 @@ func IsValidSQLIdentifier(name string) bool {
 }
 
 // queryResource mengambil satu baris dari tabel berdasarkan primary key
-// Primary key dicoba secara berurutan: ogc_fid, id, _id, fid, gid
 func (s *Server) queryResource(ctx context.Context, tableName, resourceID string) ResourceRecord {
 	// 1. Validasi regex dasar untuk nama tabel (SQL Injection Prevention)
 	if !IsValidSQLIdentifier(tableName) {
@@ -101,25 +99,39 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
-	// 2. Validasi apakah tabel tersebut benar-benar ada di schema public
-	var exists bool
-	err := s.db.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.tables 
-			WHERE table_schema = 'public' AND table_name = $1
-		)`, tableName).Scan(&exists)
-	if err != nil || !exists {
+	// Jika db tidak diinisialisasi (misal di test mock)
+	if s.db == nil {
+		log.Printf("[VerifyServer] Database tidak terhubung (nil)")
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	// 2. Validasi apakah tabel tersebut benar-benar ada di schema user saat ini atau schema lain (untuk Oracle)
+	var owner, actualTableName string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT owner, table_name 
+		FROM (
+			SELECT owner, table_name 
+			FROM all_tables 
+			WHERE UPPER(table_name) = UPPER(:1)
+			ORDER BY CASE WHEN owner = USER THEN 0 ELSE 1 END, owner
+		)
+		WHERE rownum = 1
+	`, tableName).Scan(&owner, &actualTableName)
+	if err != nil {
 		log.Printf("[VerifyServer] Tabel tidak ditemukan di database atau error: %s (err: %v)", tableName, err)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
-	// Kandidat nama kolom primary key
-	pkCandidates := []string{"ogc_fid", "id", "_id", "fid", "gid", "objectid"}
-
-	// Cari kolom PK yang ada di tabel ini
-	pkCol := s.findPKColumn(ctx, tableName, pkCandidates)
+	// Cari kolom PK yang ada di tabel ini menggunakan constraint Oracle
+	pkCol := s.findOraclePrimaryKey(ctx, owner, actualTableName)
 	if pkCol == "" {
-		log.Printf("[VerifyServer] Tidak ditemukan kolom PK di tabel %s", tableName)
+		// Fallback ke pkCandidates jika constraint PK tidak didefinisikan
+		pkCandidates := []string{"ogc_fid", "id", "_id", "fid", "gid", "objectid"}
+		pkCol = s.findPKColumn(ctx, owner, actualTableName, pkCandidates)
+	}
+
+	if pkCol == "" {
+		log.Printf("[VerifyServer] Tidak ditemukan kolom PK di tabel %s.%s", owner, actualTableName)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
@@ -129,18 +141,17 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
-	// Query baris — exclude kolom geometry otomatis via pg_catalog
-	// Ambil semua kolom kecuali tipe geometry/geography
+	// Query baris — exclude kolom geometry/LOB otomatis
 	query := `
 		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_schema = 'public' 
-		AND table_name = $1
-		AND udt_name NOT IN ('geometry', 'geography', 'raster')
-		ORDER BY ordinal_position
+		FROM all_tab_columns 
+		WHERE UPPER(table_name) = UPPER(:1) 
+		AND owner = :2
+		AND data_type NOT IN ('SDO_GEOMETRY', 'BLOB', 'CLOB', 'RAW', 'LONG')
+		ORDER BY column_id
 	`
 
-	rows, err := s.db.Query(ctx, query, tableName)
+	rows, err := s.db.QueryContext(ctx, query, actualTableName, owner)
 	if err != nil {
 		log.Printf("[VerifyServer] Gagal ambil kolom tabel %s: %v", tableName, err)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
@@ -162,7 +173,7 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
-	// Build SELECT query dengan kolom yang aman
+	// Build SELECT query dengan kolom yang aman (selalu dibungkus quotes)
 	colList := ""
 	for i, col := range columns {
 		if i > 0 {
@@ -171,9 +182,10 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 		colList += `"` + col + `"`
 	}
 
-	dataQuery := `SELECT ` + colList + ` FROM public."` + tableName + `" WHERE "` + pkCol + `" = $1 LIMIT 1`
+	// Gunakan ROWNUM <= 1 untuk Oracle
+	dataQuery := `SELECT ` + colList + ` FROM "` + owner + `"."` + actualTableName + `" WHERE "` + pkCol + `" = :1 AND ROWNUM <= 1`
 
-	dataRows, err := s.db.Query(ctx, dataQuery, resourceID)
+	dataRows, err := s.db.QueryContext(ctx, dataQuery, resourceID)
 	if err != nil {
 		log.Printf("[VerifyServer] Gagal query tabel %s id=%s: %v", tableName, resourceID, err)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
@@ -181,22 +193,37 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 	defer dataRows.Close()
 
 	if !dataRows.Next() {
-		// Baris tidak ditemukan — kemungkinan sudah di-DELETE
+		// Baris tidak ditemukan
 		log.Printf("[VerifyServer] Baris tidak ditemukan: tabel=%s id=%s", tableName, resourceID)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
 	// Scan hasil ke map
-	fieldDescriptions := dataRows.FieldDescriptions()
-	values, err := dataRows.Values()
+	cols, err := dataRows.Columns()
 	if err != nil {
+		log.Printf("[VerifyServer] Gagal get columns: %v", err)
+		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
+	}
+
+	values := make([]interface{}, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := dataRows.Scan(valuePtrs...); err != nil {
 		log.Printf("[VerifyServer] Gagal scan values: %v", err)
 		return ResourceRecord{Found: false, Table: tableName, ID: resourceID, CheckedAt: time.Now()}
 	}
 
 	data := make(map[string]interface{})
-	for i, fd := range fieldDescriptions {
-		data[string(fd.Name)] = values[i]
+	for i, colName := range cols {
+		val := values[i]
+		if b, ok := val.([]byte); ok {
+			data[colName] = string(b)
+		} else {
+			data[colName] = val
+		}
 	}
 
 	return ResourceRecord{
@@ -208,20 +235,38 @@ func (s *Server) queryResource(ctx context.Context, tableName, resourceID string
 	}
 }
 
-// findPKColumn mencari kolom primary key yang ada di tabel
-func (s *Server) findPKColumn(ctx context.Context, tableName string, candidates []string) string {
+// findOraclePrimaryKey mencari kolom primary key menggunakan Oracle constraint catalogs
+func (s *Server) findOraclePrimaryKey(ctx context.Context, owner, tableName string) string {
+	query := `
+		SELECT cols.column_name
+		FROM all_constraints cons
+		JOIN all_cons_columns cols ON cons.constraint_name = cols.constraint_name AND cons.owner = cols.owner
+		WHERE cons.constraint_type = 'P'
+		  AND cons.owner = :1
+		  AND cons.table_name = :2
+		  AND rownum = 1
+	`
+	var pkCol string
+	err := s.db.QueryRowContext(ctx, query, owner, tableName).Scan(&pkCol)
+	if err == nil && pkCol != "" {
+		return pkCol
+	}
+	return ""
+}
+
+// findPKColumn mencari kolom primary key yang ada di tabel menggunakan kandidat
+func (s *Server) findPKColumn(ctx context.Context, owner, tableName string, candidates []string) string {
 	query := `
 		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_schema = 'public' 
-		AND table_name = $1 
-		AND column_name = ANY($2)
-		LIMIT 1
+		FROM all_tab_columns 
+		WHERE UPPER(table_name) = UPPER(:1) 
+		AND owner = :2 
+		AND UPPER(column_name) = UPPER(:3)
 	`
 
 	var colName string
 	for _, candidate := range candidates {
-		err := s.db.QueryRow(ctx, query, tableName, []string{candidate}).Scan(&colName)
+		err := s.db.QueryRowContext(ctx, query, tableName, owner, candidate).Scan(&colName)
 		if err == nil {
 			return colName
 		}
@@ -229,13 +274,14 @@ func (s *Server) findPKColumn(ctx context.Context, tableName string, candidates 
 	return ""
 }
 
-// handleVerify — endpoint lama untuk SIMRS (audit_trail by id)
+// handleVerify melayani GET /verify/<table>/<id> untuk database non-spasial (seperti SIMRS)
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	// Autentikasi
 	if s.verifyToken != "" {
 		got := r.Header.Get("Authorization")
 		if got != "Bearer "+s.verifyToken {
@@ -244,17 +290,20 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	auditTrailID := r.URL.Path[len("/verify/"):]
-	if auditTrailID == "" {
-		http.Error(w, "audit_trail_id diperlukan", http.StatusBadRequest)
+	// Ekstrak table dan id dari path: /verify/<table>/<id>
+	path := strings.TrimPrefix(r.URL.Path, "/verify/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "format path harus /verify/<table>/<id>", http.StatusBadRequest)
 		return
 	}
 
+	tableName := parts[0]
+	resourceID := parts[1]
+
+	rec := s.queryResource(r.Context(), tableName, resourceID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"found":   false,
-		"message": "endpoint ini tidak digunakan untuk Satu Peta",
-	})
+	json.NewEncoder(w).Encode(rec)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

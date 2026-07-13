@@ -95,3 +95,33 @@ func TestHandleVerifyResource_Auth(t *testing.T) {
 		t.Errorf("expected unauthorized (401) for wrong token, got %v", rr2.Code)
 	}
 }
+
+func TestHandleVerify_Auth(t *testing.T) {
+	server := NewServer(nil, "secret-token", "9090")
+
+	// 1. Test unauthorized request (missing token)
+	req1, err := http.NewRequest(http.MethodGet, "/verify/users/1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr1 := httptest.NewRecorder()
+	handler := http.HandlerFunc(server.handleVerify)
+	handler.ServeHTTP(rr1, req1)
+
+	if rr1.Code != http.StatusUnauthorized {
+		t.Errorf("expected unauthorized (401), got %v", rr1.Code)
+	}
+
+	// 2. Test authorized request but bad URL format (missing ID)
+	req2, err := http.NewRequest(http.MethodGet, "/verify/users/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Authorization", "Bearer secret-token")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+
+	if rr2.Code != http.StatusBadRequest {
+		t.Errorf("expected bad request (400), got %v", rr2.Code)
+	}
+}
