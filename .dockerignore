@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+.agents
+*.md
+*.log
+tmp/
+bin/
+auditchain-agent

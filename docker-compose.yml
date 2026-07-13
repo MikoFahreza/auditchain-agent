@@ -1,0 +1,29 @@
+services:
+  auditchain-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: auditchain-agent:latest
+    container_name: auditchain-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Bisa juga di-override langsung di sini, tapi lebih rapi lewat .env
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      AGENT_VERIFY_TOKEN: ${AGENT_VERIFY_TOKEN}
+      AGENT_VERIFY_PORT: ${AGENT_VERIFY_PORT:-9090}
+    ports:
+      - "${AGENT_VERIFY_PORT:-9090}:${AGENT_VERIFY_PORT:-9090}"
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
